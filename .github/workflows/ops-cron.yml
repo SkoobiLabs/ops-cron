@@ -1,0 +1,138 @@
+name: SkoobiLabs Ops Cron
+
+# WHY THIS EXISTS
+# The admin ops crons used to run on Vercel and silently died for 3 months (Apr–Jul 2026):
+# a fan-out via fetch(VERCEL_URL) hit Vercel Deployment Protection, failed, was swallowed, and
+# still reported HTTP 200 — so no alarm ever fired. This workflow drives the crons from OUTSIDE
+# Vercel, and a FAILED run emails the repo owner = the dead-man's-switch that was missing.
+#
+# WHY THIS REPO (public, separate from arnegaenz/admin)
+# GitHub Actions bills each private-repo job a minimum of 1 minute; at ~193 jobs/day this burned
+# the free 2,000 min/month in ~10 days and every job was billing-blocked (2026-08-22 incident).
+# Public repos get free unlimited standard-runner minutes. Nothing here is secret: the endpoint
+# URLs are non-secret by studio SECURITY.md (auth is the CRON_SECRET gate, held as an Actions
+# secret — never exposed, and scheduled runs execute only from the default branch).
+#
+#   - process-emails    : ask@ triage + AI pre-triage, every 15 min (time-sensitive)
+#   - domain-health     : TLS + HTTP probe of every studio domain, every 30 min
+#   - connector-health  : live-product credential probes (token grants, SAS), every 30 min
+#   - daily-ops         : reviews / ad-metrics / data-health / summary, once daily
+#
+# SETUP: repo secret CRON_SECRET (Settings → Secrets and variables → Actions) = admin's Vercel
+# CRON_SECRET. Until set, all jobs no-op green (guard step) so no failure spam.
+#
+# KEEPALIVE: GitHub auto-disables scheduled workflows after 60 days without repo activity.
+# The keepalive job pushes an empty commit monthly so the schedules never go dormant.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *" # process-emails — every 15 min
+    - cron: "3-59/30 * * * *" # domain-health — every 30 min (offset so it never collides with the /15 tick)
+    - cron: "9-59/30 * * * *" # connector-health — every 30 min (own offset, no tick collisions)
+    - cron: "20 14 * * *" # daily-ops — once daily 14:20 UTC (~7:20am PT: morning briefing)
+    - cron: "41 6 1 * *" # keepalive — monthly empty commit so GitHub never auto-disables the schedules
+  workflow_dispatch: {} # manual "Run workflow" runs all (except keepalive)
+
+concurrency:
+  group: ops-cron
+  cancel-in-progress: false
+
+jobs:
+  process-emails:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '*/15 * * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Guard — skip until CRON_SECRET is configured
+        id: guard
+        run: |
+          if [ -z "${{ secrets.CRON_SECRET }}" ]; then echo "run=false" >> "$GITHUB_OUTPUT"; else echo "run=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Trigger ask@ email triage
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          code=$(curl -sS --max-time 120 -o /tmp/out.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "https://admin.skoobilabs.com/api/cron/process-emails")
+          echo "HTTP $code"; cat /tmp/out.json || true; echo ""
+          if [ "$code" != "200" ]; then echo "::error::process-emails returned HTTP $code — ask@ is NOT processing"; exit 1; fi
+      - name: AI pre-triage (new alerts + emails get a recommendation)
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          code=$(curl -sS --max-time 280 -o /tmp/ai.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "https://admin.skoobilabs.com/api/cron/ai-triage")
+          echo "HTTP $code"; cat /tmp/ai.json || true; echo ""
+          if [ "$code" != "200" ]; then echo "::error::ai-triage returned HTTP $code — items arriving unrecommended"; exit 1; fi
+
+  domain-health:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '3-59/30 * * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Guard — skip until CRON_SECRET is configured
+        id: guard
+        run: |
+          if [ -z "${{ secrets.CRON_SECRET }}" ]; then echo "run=false" >> "$GITHUB_OUTPUT"; else echo "run=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Probe every studio domain (TLS + HTTP)
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          code=$(curl -sS --max-time 180 -o /tmp/out.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "https://admin.skoobilabs.com/api/cron/domain-health")
+          echo "HTTP $code"; cat /tmp/out.json || true; echo ""
+          if [ "$code" != "200" ]; then echo "::error::domain-health returned HTTP $code — the domain watchdog is NOT running"; exit 1; fi
+          if grep -q '"ok":false' /tmp/out.json; then echo "::error::one or more domains FAILED their probe — see output above"; exit 1; fi
+
+  connector-health:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '9-59/30 * * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Guard — skip until CRON_SECRET is configured
+        id: guard
+        run: |
+          if [ -z "${{ secrets.CRON_SECRET }}" ]; then echo "run=false" >> "$GITHUB_OUTPUT"; else echo "run=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Probe every live-product credential (token grants, SAS)
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          code=$(curl -sS --max-time 180 -o /tmp/out.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "https://admin.skoobilabs.com/api/cron/connector-health")
+          echo "HTTP $code"; cat /tmp/out.json || true; echo ""
+          if [ "$code" != "200" ]; then echo "::error::connector-health returned HTTP $code — the credential watchdog is NOT running"; exit 1; fi
+          if grep -q '"ok":false' /tmp/out.json; then echo "::error::one or more connectors FAILED their probe — see output above"; exit 1; fi
+
+  daily-ops:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '20 14 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Guard — skip until CRON_SECRET is configured
+        id: guard
+        run: |
+          if [ -z "${{ secrets.CRON_SECRET }}" ]; then echo "run=false" >> "$GITHUB_OUTPUT"; else echo "run=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Trigger daily ops (reviews, ad-metrics, data-health, summary)
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          code=$(curl -sS --max-time 290 -o /tmp/out.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "https://admin.skoobilabs.com/api/cron/daily-ops")
+          echo "HTTP $code"; cat /tmp/out.json || true; echo ""
+          # daily-ops returns 200 even when a sub-job fails (it emails ops directly for those).
+          # A non-200 here means the whole endpoint is down/unreachable — the thing GitHub must alarm on.
+          if [ "$code" != "200" ]; then echo "::error::daily-ops returned HTTP $code — the ops cron is down"; exit 1; fi
+
+  keepalive:
+    if: github.event.schedule == '41 6 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Empty commit so scheduled workflows never auto-disable
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "keepalive: $(date -u +%Y-%m-%d)"
+          git push
