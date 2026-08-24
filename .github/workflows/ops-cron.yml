@@ -17,6 +17,7 @@ name: SkoobiLabs Ops Cron
 #   - domain-health     : TLS + HTTP probe of every studio domain, every 30 min
 #   - connector-health  : live-product credential probes (token grants, SAS), every 30 min
 #   - daily-ops         : reviews / ad-metrics / data-health / summary, once daily
+#   - finance-weekly    : statements owed + invoices in flight + AI spend alerts, Mondays
 #
 # SETUP: repo secret CRON_SECRET (Settings → Secrets and variables → Actions) = admin's Vercel
 # CRON_SECRET. Until set, all jobs no-op green (guard step) so no failure spam.
@@ -30,6 +31,7 @@ on:
     - cron: "3-59/30 * * * *" # domain-health — every 30 min (offset so it never collides with the /15 tick)
     - cron: "9-59/30 * * * *" # connector-health — every 30 min (own offset, no tick collisions)
     - cron: "20 14 * * *" # daily-ops — once daily 14:20 UTC (~7:20am PT: morning briefing)
+    - cron: "5 14 * * 1" # finance-weekly — Mondays 14:05 UTC (~7:05am PT: statements owed, invoices in flight)
     - cron: "41 6 1 * *" # keepalive — monthly empty commit so GitHub never auto-disables the schedules
   workflow_dispatch: {} # manual "Run workflow" runs all (except keepalive)
 
@@ -121,6 +123,24 @@ jobs:
           # daily-ops returns 200 even when a sub-job fails (it emails ops directly for those).
           # A non-200 here means the whole endpoint is down/unreachable — the thing GitHub must alarm on.
           if [ "$code" != "200" ]; then echo "::error::daily-ops returned HTTP $code — the ops cron is down"; exit 1; fi
+
+  finance-weekly:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '5 14 * * 1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Guard — skip until CRON_SECRET is configured
+        id: guard
+        run: |
+          if [ -z "${{ secrets.CRON_SECRET }}" ]; then echo "run=false" >> "$GITHUB_OUTPUT"; else echo "run=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Weekly finance to-dos (statements owed, invoices in flight, AI alerts)
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          code=$(curl -sS --max-time 120 -o /tmp/out.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "https://admin.skoobilabs.com/api/cron/finance-weekly")
+          echo "HTTP $code"; cat /tmp/out.json || true; echo ""
+          if [ "$code" != "200" ]; then echo "::error::finance-weekly returned HTTP $code — the finance digest is down"; exit 1; fi
 
   keepalive:
     if: github.event.schedule == '41 6 1 * *'
