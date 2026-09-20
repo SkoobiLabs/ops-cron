@@ -83,7 +83,15 @@ jobs:
             "https://admin.skoobilabs.com/api/cron/domain-health")
           echo "HTTP $code"; cat /tmp/out.json || true; echo ""
           if [ "$code" != "200" ]; then echo "::error::domain-health returned HTTP $code — the domain watchdog is NOT running"; exit 1; fi
-          if grep -q '"ok":false' /tmp/out.json; then echo "::error::one or more domains FAILED their probe — see output above"; exit 1; fi
+          # NOT a failure of this workflow. The probe RAN and reported — and it
+          # already files a deduped data_alert + ops email naming whose move it
+          # is. Failing here too sent a SECOND, UNDEDUPED email on every tick:
+          # the A2P campaign probe added 2026-09-17 produced 18 "Run failed"
+          # emails in 2.5 days for one known condition with an open support
+          # ticket. GitHub cannot dedupe and cannot carry the whose-move text,
+          # so it is the wrong channel for a reported finding. This job is red
+          # only when the watchdog itself did not run (the HTTP check above).
+          if grep -q '"ok":false' /tmp/out.json; then echo "::warning::one or more domains are unhealthy — the probe reported it and alerted; see output above"; fi
 
   connector-health:
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '9-59/30 * * * *'
@@ -102,7 +110,15 @@ jobs:
             "https://admin.skoobilabs.com/api/cron/connector-health")
           echo "HTTP $code"; cat /tmp/out.json || true; echo ""
           if [ "$code" != "200" ]; then echo "::error::connector-health returned HTTP $code — the credential watchdog is NOT running"; exit 1; fi
-          if grep -q '"ok":false' /tmp/out.json; then echo "::error::one or more connectors FAILED their probe — see output above"; exit 1; fi
+          # NOT a failure of this workflow. The probe RAN and reported — and it
+          # already files a deduped data_alert + ops email naming whose move it
+          # is. Failing here too sent a SECOND, UNDEDUPED email on every tick:
+          # the A2P campaign probe added 2026-09-17 produced 18 "Run failed"
+          # emails in 2.5 days for one known condition with an open support
+          # ticket. GitHub cannot dedupe and cannot carry the whose-move text,
+          # so it is the wrong channel for a reported finding. This job is red
+          # only when the watchdog itself did not run (the HTTP check above).
+          if grep -q '"ok":false' /tmp/out.json; then echo "::warning::one or more connectors are unhealthy — the probe reported it and alerted; see output above"; fi
 
   daily-ops:
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '20 14 * * *'
